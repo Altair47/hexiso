@@ -1,0 +1,54 @@
+[package]
+name = "hexiso"
+version = "0.1.0"
+edition = "2024"
+description = "Fast portable disc image toolkit: open, edit, extract, build, convert, compress, mount and burn ISO images"
+readme = "README.md"
+keywords = ["iso", "disc-image", "udf", "burning", "egui"]
+categories = ["filesystem", "command-line-utilities", "gui"]
+authors = ["Nick Petropoulos <https://github.com/Altair47>"]
+license = "AGPL-3.0-only"
+homepage = "https://github.com/Altair47/hexiso"
+repository = "https://github.com/Altair47/hexiso"
+
+[dependencies]
+chacha20poly1305 = "0.10"
+crc32fast = "1.5.5"
+eframe = "0.37.0"
+flate2 = "1.1.11"
+getrandom = "0.2"
+md-5 = "0.10"
+pbkdf2 = "0.12"
+png = "0.18.1"
+rfd = "0.18.0"
+sha1 = "0.10"
+sha2 = "0.10"
+zip = "9.5.0"
+# lightweight CPU window path (no GPU needed)
+egui-winit = { version = "0.37", default-features = false, features = ["clipboard", "links"] }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+softbuffer = "0.4"
+hdrshot-egui-backend = "0.2"
+pollster = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_Security", "Win32_System_Console"] }
+
+[build-dependencies]
+png = "0.18.1"
+winresource = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "unwind"
+
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"   # usable backtraces, much smaller build folder
+
+[profile.dev.package."*"]
+opt-level = 3
+debug = false

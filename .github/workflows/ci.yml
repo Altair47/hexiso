@@ -1,0 +1,52 @@
+# HEXISO - Copyright (C) Nick Petropoulos (https://github.com/Altair47)
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Builds, lints and runs the engine self-test on every push and pull request.
+# On a tag like v0.1.0 it also builds the portable zip and attaches it to a draft GitHub release.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --release -- -D warnings
+      - name: Build
+        run: cargo build --release
+      - name: Engine self-test
+        run: target\release\hexiso.exe selftest "$env:RUNNER_TEMP\hexiso-selftest"
+      - name: Command line check
+        run: |
+          target\release\hexiso.exe version
+          target\release\hexiso.exe create "$env:RUNNER_TEMP\ci.iso" README.md src --label CI -q
+          target\release\hexiso.exe info "$env:RUNNER_TEMP\ci.iso" --json
+          target\release\hexiso.exe test "$env:RUNNER_TEMP\ci.iso" -q
+      - name: Package (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: >
+          powershell -ExecutionPolicy Bypass -File package.ps1
+          -Url "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/hexiso-$("${{ github.ref_name }}".TrimStart('v'))-win64.zip"
+          -Homepage "https://github.com/${{ github.repository }}"
+      - name: Draft release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            dist/*.zip
+            dist/*.zip.sha256
+            dist/hexiso.json

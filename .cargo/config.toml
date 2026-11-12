@@ -1,0 +1,10 @@
+# Link the C runtime statically so hexiso.exe runs on any Windows 10/11 PC
+# without installing the Visual C++ redistributable (a true single-file portable app).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
