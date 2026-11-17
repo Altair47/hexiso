@@ -8,7 +8,6 @@ keywords = ["iso", "disc-image", "udf", "burning", "egui"]
 categories = ["filesystem", "command-line-utilities", "gui"]
 authors = ["Nick Petropoulos <https://github.com/Altair47>"]
 license = "AGPL-3.0-only"
-homepage = "https://github.com/Altair47/hexiso"
 repository = "https://github.com/Altair47/hexiso"
 
 [dependencies]

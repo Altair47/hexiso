@@ -402,10 +402,8 @@ fn has_sig(f: &MultiFile, header: u64, ss: u64, doff: u64) -> bool {
         return true;
     }
     let mut t = [0u8; 16];
-    if f.read_at(at(256), &mut t).is_ok() && u16le(&t, 0) == 2 && u32le(&t, 12) == 256 {
-        return true;
-    }
-    false
+    // UDF anchor volume descriptor pointer at sector 256
+    f.read_at(at(256), &mut t).is_ok() && u16le(&t, 0) == 2 && u32le(&t, 12) == 256
 }
 
 pub fn open_image(path: &Path, password: Option<&str>) -> io::Result<Opened> {
