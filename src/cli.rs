@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const COMMANDS: &[&str] = &[
-    "help", "version", "info", "ls", "extract", "create", "add", "rm", "rename", "mkdir", "label", "boot", "convert", "checksum", "test", "split", "mount", "unmount", "mounts",
+    "help", "version", "info", "ls", "extract", "create", "add", "rm", "rename", "mkdir", "label", "boot", "convert", "checksum", "test", "split", "mount", "unmount", "eject", "mounts",
     "drives", "burn", "make-image", "rip", "floppy", "usb", "selftest",
 ];
 
@@ -54,6 +54,8 @@ DRIVES (Windows)
   mounts                                   images mounted right now
   mount    <image>                         mount as a virtual drive, prints the drive letter
   unmount  <image>                         eject every drive made from this image
+  eject    --drive <E>                     open the disc tray / prepare a USB stick for removal
+                                           (a mounted image's drive is unmounted)
   burn     <image> --drive <E>             hand the image to Windows' disc burner
   make-image --drive <E> <out>             read a disc / USB drive into an image file
   rip      --drive <E> <dest-dir> [--tracks 1,3,5]   audio CD -> WAV
@@ -417,8 +419,11 @@ fn command(cmd: &str, a: &Args) -> Result<(), String> {
             };
             es(std::fs::create_dir_all(&dest))?;
             let (n, failed) = progress(quiet, "extracting", |p| ops::extract(&d, &items, &dest, p)).map_err(|e| e.to_string())?;
-            println!("extracted {} file(s) to {}{}", n, dest.display(), if failed > 0 { format!(", {} failed", failed) } else { String::new() });
-            if failed > 0 { Err(format!("{} file(s) could not be read", failed)) } else { Ok(()) }
+            for f in &failed {
+                eprintln!("failed: {}", f);
+            }
+            println!("extracted {} file(s) to {}{}", n, dest.display(), if failed.is_empty() { String::new() } else { format!(", {} failed", failed.len()) });
+            if failed.is_empty() { Ok(()) } else { Err(format!("{} file(s) could not be read", failed.len())) }
         }
         "create" | "floppy" => {
             let out = PathBuf::from(a.need(0, "usage: hexiso create <out> <files/folders...>")?);
@@ -637,18 +642,23 @@ fn command(cmd: &str, a: &Args) -> Result<(), String> {
             let iso = iso_for(&path, a)?;
             let full = std::fs::canonicalize(&iso).unwrap_or(iso.clone());
             let full_s = full.display().to_string().trim_start_matches(r"\\?\").to_string();
-            if let Some((_, l)) = drives::mounted().into_iter().find(|(p, _)| p.eq_ignore_ascii_case(&full_s))
-                && !a.flag("again") {
-                    if json { println!("{{\"drive\":{},\"already\":true}}", js(&l)) } else { println!("{}", l) }
-                    eprintln!("(already mounted; pass --again to add another drive)");
-                    return Ok(());
-                }
+            if let Some((_, l)) = drives::mounted().into_iter().find(|(p, _)| p.eq_ignore_ascii_case(&full_s)) {
+                if json { println!("{{\"drive\":{},\"already\":true}}", js(&l)) } else { println!("{}", l) }
+                eprintln!("(already mounted)");
+                return Ok(());
+            }
             let l = es(drives::mount(Path::new(&full_s)))?;
             if json { println!("{{\"drive\":{},\"already\":false}}", js(&l)) } else { println!("{}", l) }
             Ok(())
         }
+        "eject" if a.opt("drive").is_some() && a.pos.is_empty() => {
+            let l = drive_letter(a)?;
+            es(drives::eject(l))?;
+            println!("ejected {}:", l);
+            Ok(())
+        }
         "unmount" | "eject" => {
-            let path = PathBuf::from(a.need(0, "usage: hexiso unmount <image>")?);
+            let path = PathBuf::from(a.need(0, "usage: hexiso unmount <image>   or   hexiso eject --drive <E>")?);
             let full = std::fs::canonicalize(&path).map(|p| p.display().to_string().trim_start_matches(r"\\?\").to_string()).unwrap_or_else(|_| path.display().to_string());
             es(drives::unmount(Path::new(&full)))?;
             println!("unmounted {}", full);
@@ -695,6 +705,10 @@ fn command(cmd: &str, a: &Args) -> Result<(), String> {
         "usb" => {
             let path = a.need(0, "usage: hexiso usb <image> --drive <F> [--format FAT32] --yes")?;
             let l = drive_letter(a)?;
+            let fmt = match a.opt("format") {
+                Some(f) => Some(drives::format_name(f).ok_or_else(|| format!("unknown file system '{}' (use {})", f, drives::FORMATS.join(", ")))?),
+                None => None,
+            };
             let info = drives::list().into_iter().find(|d| d.letter == l).ok_or_else(|| format!("drive {}: not found", l))?;
             if info.kind != drives::DriveKind::Removable && !a.flag("force") {
                 return Err(format!("{}: is not a removable drive (pass --force if you are sure)", l));
@@ -703,7 +717,7 @@ fn command(cmd: &str, a: &Args) -> Result<(), String> {
                 return Err(format!("this writes to drive {}: ({}). Re-run with --yes to confirm", l, info.label));
             }
             let d = open_doc(path, a)?;
-            if let Some(f) = a.opt("format") {
+            if let Some(f) = fmt {
                 eprintln!("formatting {}: as {} ...", l, f);
                 let label: String = d.label.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(11).collect();
                 es(drives::format_drive(l, f, if label.is_empty() { "HEXISO" } else { &label }))?;
@@ -711,8 +725,11 @@ fn command(cmd: &str, a: &Args) -> Result<(), String> {
             let items = d.root.children().cloned().unwrap_or_default();
             let dest = PathBuf::from(format!("{}:\\", l));
             let (n, failed) = progress(quiet, "copying", |p| ops::extract(&d, &items, &dest, p)).map_err(|e| e.to_string())?;
+            for f in &failed {
+                eprintln!("failed: {}", f);
+            }
             println!("{} file(s) copied to {}:", n, l);
-            if failed > 0 { Err(format!("{} file(s) failed", failed)) } else { Ok(()) }
+            if failed.is_empty() { Ok(()) } else { Err(format!("{} file(s) failed", failed.len())) }
         }
         "selftest" => {
             let dir = a.pos.first().map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("hexiso-selftest"));

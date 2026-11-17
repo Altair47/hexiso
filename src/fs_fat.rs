@@ -240,14 +240,21 @@ pub fn partitions(src: &dyn SectorSource) -> Vec<(u64, u64, String)> {
             let lba = u64le(&h, 72);
             let n = u32le(&h, 80).min(256) as u64;
             let sz = u32le(&h, 84) as u64;
+            // entries are 128 bytes (a multiple of 128 is allowed); anything else is damage
+            if !(128..=4096).contains(&sz) || !sz.is_multiple_of(128) {
+                return out;
+            }
             let mut t = vec![0u8; (n * sz) as usize];
-            if read_range(src, lba * 512, &mut t).is_ok() {
+            if read_range(src, lba.saturating_mul(512), &mut t).is_ok() {
                 for e in t.chunks(sz as usize) {
                     if e.len() < 128 || e[0..16].iter().all(|&x| x == 0) {
                         continue;
                     }
                     let first = u64le(e, 32);
                     let last = u64le(e, 40);
+                    if last < first || last >= u64::MAX / 512 {
+                        continue;
+                    }
                     let u: Vec<u16> = e[56..128].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).collect();
                     out.push((first * 512, (last - first + 1) * 512, format!("GPT {}", String::from_utf16_lossy(&u))));
                 }
@@ -490,4 +497,42 @@ pub fn make_floppy(doc: &Document, label: &str, big: bool) -> io::Result<Vec<u8>
     let (a, bb) = w.img.split_at_mut(fat_off + w.fat_bytes);
     bb[..w.fat_bytes].copy_from_slice(&a[fat_off..fat_off + w.fat_bytes]);
     Ok(w.img)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source::tests::MemSrc;
+
+    /// Protective MBR + GPT header with the given entry size and one entry.
+    fn gpt_disk(entry_size: u32, first: u64, last: u64) -> Vec<u8> {
+        let mut d = vec![0u8; 4096];
+        d[510] = 0x55;
+        d[511] = 0xAA;
+        d[446 + 4] = 0xEE;
+        d[512..520].copy_from_slice(b"EFI PART");
+        d[512 + 72..512 + 80].copy_from_slice(&2u64.to_le_bytes());
+        d[512 + 80..512 + 84].copy_from_slice(&1u32.to_le_bytes());
+        d[512 + 84..512 + 88].copy_from_slice(&entry_size.to_le_bytes());
+        let e = 1024;
+        d[e] = 1; // non-zero type GUID
+        d[e + 32..e + 40].copy_from_slice(&first.to_le_bytes());
+        d[e + 40..e + 48].copy_from_slice(&last.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn gpt_valid_entry_is_listed() {
+        let p = partitions(&MemSrc(gpt_disk(128, 34, 2081)));
+        assert_eq!(p.len(), 1);
+        assert_eq!((p[0].0, p[0].1), (34 * 512, 2048 * 512));
+    }
+
+    #[test]
+    fn gpt_damaged_header_does_not_crash() {
+        // entry size 0 (chunks(0) panics), 4 GB (huge allocation), and last < first (underflow)
+        assert!(partitions(&MemSrc(gpt_disk(0, 34, 100))).is_empty());
+        assert!(partitions(&MemSrc(gpt_disk(u32::MAX, 34, 100))).is_empty());
+        assert!(partitions(&MemSrc(gpt_disk(128, 100, 34))).is_empty());
+    }
 }

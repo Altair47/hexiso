@@ -571,7 +571,7 @@ pub fn write_iso<W: Write>(doc: &Document, opts: &WriteOpts, out: W, prog: &Prog
         let mut left = fl.size;
         while left > 0 {
             if prog.cancelled() {
-                return Err(io::Error::other("cancelled"));
+                return Err(crate::jobs::cancelled());
             }
             let n = (left as usize).min(buf.len());
             r.read_exact(&mut buf[..n]).map_err(|e| io::Error::new(e.kind(), format!("reading {}: {}", String::from_utf8_lossy(&fl.iso_id), e)))?;

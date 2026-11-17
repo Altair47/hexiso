@@ -5,7 +5,10 @@ description: HEXISO's testing setup (engine self-test, PowerShell smoke test, sc
 
 # Testing HEXISO
 
-There are no `cargo test` unit tests yet; verification is end-to-end and exercises the real binary.
+Verification is mostly end-to-end and exercises the real binary. Unit tests (`cargo test --release`)
+cover what the binary can't easily show: damaged headers that would crash or exhaust memory, and
+extract-name safety. They live in `#[cfg(test)] mod tests` at the end of `source.rs`, `hxz.rs`,
+`fs_fat.rs`, `ops.rs`; `source::tests::{MemSrc, temp_file}` give an in-memory image and a temp file.
 
 ## 1. Engine self-test (seconds, no window)
 

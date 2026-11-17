@@ -19,11 +19,13 @@ parsing, dynamic VHD/VHDX, VMDK, VDI, DMG, 7z/RAR, NTFS/exFAT/ext/HFS+ readers, 
 ## Add a container
 
 1. Implement `SectorSource` in `source.rs` (or its own module): positional reads only, `Send + Sync`,
-   zero-fill reads past the end instead of erroring on truncated images.
+   zero-fill reads past the end instead of erroring on truncated images. Header fields are hostile:
+   check index sizes against the file length and block sizes against `source::MAX_BLOCK` before
+   allocating, and wrap decompressors in `.take(block)`. Add a unit test with a damaged header.
 2. Add detection to `open_image`: a magic check before the layout probe, or a new
    `(header, sector_size, data_offset, name)` candidate if it is a raw layout.
 3. Put useful facts in `details()`; they appear in the properties panel and `info --json`.
-4. Add the extension to the open-file filter in `app.rs` (`open_dialog`) and the convert dialog.
+4. Add the extension to the open-file filter in `app/actions.rs` (`open_dialog`) and the convert dialog.
 5. Extend `selftest.rs` with a round trip (write or synthesise a sample, read it back, compare bytes).
 
 ## Add a file-system reader

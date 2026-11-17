@@ -51,6 +51,26 @@ impl Progress {
     }
 }
 
+/// The error a job returns when the user pressed cancel.
+#[derive(Debug)]
+struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+pub fn cancelled() -> std::io::Error {
+    std::io::Error::other(Cancelled)
+}
+
+pub fn is_cancelled(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|i| i.is::<Cancelled>())
+}
+
 pub struct Job {
     pub title: String,
     pub prog: Arc<Progress>,

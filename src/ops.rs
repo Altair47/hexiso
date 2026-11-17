@@ -297,7 +297,7 @@ fn save_zip(doc: &Document, path: &Path, prog: &Progress) -> io::Result<u64> {
     fn walk(doc: &Document, e: &Entry, prefix: &str, z: &mut zip::ZipWriter<io::BufWriter<File>>, prog: &Progress) -> io::Result<()> {
         for k in e.children().into_iter().flatten() {
             if prog.cancelled() {
-                return Err(io::Error::other("cancelled"));
+                return Err(crate::jobs::cancelled());
             }
             let name = format!("{}{}", prefix, k.name);
             let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated).large_file(k.size() > 0xFFFF_0000);
@@ -351,7 +351,7 @@ pub fn convert(src: &Src, target: &Path, fmt: OutFormat, password: Option<&str>,
         let n = src.sector_count();
         while lba < n {
             if prog.cancelled() {
-                return Err(io::Error::other("cancelled"));
+                return Err(crate::jobs::cancelled());
             }
             let k = chunk.min(n - lba);
             let b = &mut buf[..(k * SECTOR) as usize];
@@ -369,7 +369,6 @@ pub fn convert(src: &Src, target: &Path, fmt: OutFormat, password: Option<&str>,
     });
     match r {
         Ok(n) => {
-            let _ = std::fs::remove_file(target);
             std::fs::rename(&tmp, target)?;
             Ok(n)
         }
@@ -380,23 +379,50 @@ pub fn convert(src: &Src, target: &Path, fmt: OutFormat, password: Option<&str>,
     }
 }
 
-/// Extract entries into a folder.
-pub fn extract(doc: &Document, items: &[Entry], dest: &Path, prog: &Progress) -> io::Result<(u64, u64)> {
+/// A file name that is safe to create inside a folder: no path separators or characters Windows
+/// refuses, never `.` / `..` / empty, no reserved device names (CON, NUL, COM1, ...), no trailing
+/// dots or spaces (Windows drops them silently), and unique (case-insensitive) among `used`.
+pub fn safe_name(name: &str, used: &mut std::collections::HashSet<String>) -> String {
+    let mut s: String = name.chars().map(|c| if "<>:\"/\\|?*".contains(c) || (c as u32) < 32 { '_' } else { c }).collect();
+    s.truncate(s.trim_end_matches(['.', ' ']).len());
+    if s.is_empty() {
+        s.push('_');
+    }
+    let stem = s.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || (stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && stem.as_bytes()[3].is_ascii_digit() && stem.as_bytes()[3] != b'0');
+    if reserved {
+        s.insert(0, '_');
+    }
+    let (base, ext) = match s.rfind('.') {
+        Some(i) if i > 0 => (s[..i].to_string(), s[i..].to_string()),
+        _ => (s.clone(), String::new()),
+    };
+    let mut n = 1;
+    while !used.insert(s.to_lowercase()) {
+        n += 1;
+        s = format!("{} ({}){}", base, n, ext);
+    }
+    s
+}
+
+/// Extract entries into a folder. Returns (files written, "path: reason" for each file that failed).
+pub fn extract(doc: &Document, items: &[Entry], dest: &Path, prog: &Progress) -> io::Result<(u64, Vec<String>)> {
     let total: u64 = items.iter().map(|e| e.size()).sum();
     prog.set_total(total);
     let mut files = 0;
-    let mut failed = 0;
-    fn go(doc: &Document, e: &Entry, dest: &Path, prog: &Progress, files: &mut u64, failed: &mut u64) -> io::Result<()> {
+    let mut failed = Vec::new();
+    fn go(doc: &Document, e: &Entry, dest: &Path, used: &mut std::collections::HashSet<String>, prog: &Progress, files: &mut u64, failed: &mut Vec<String>) -> io::Result<()> {
         if prog.cancelled() {
-            return Err(io::Error::other("cancelled"));
+            return Err(crate::jobs::cancelled());
         }
-        let safe: String = e.name.chars().map(|c| if "<>:\"/\\|?*".contains(c) || (c as u32) < 32 { '_' } else { c }).collect();
-        let p = dest.join(safe);
+        let p = dest.join(safe_name(&e.name, used));
         match &e.kind {
             Kind::Dir(k) => {
                 std::fs::create_dir_all(&p)?;
+                let mut inner = std::collections::HashSet::new();
                 for c in k {
-                    go(doc, c, &p, prog, files, failed)?;
+                    go(doc, c, &p, &mut inner, prog, files, failed)?;
                 }
             }
             Kind::File { size, src } => {
@@ -413,22 +439,23 @@ pub fn extract(doc: &Document, items: &[Entry], dest: &Path, prog: &Progress) ->
                         f.write_all(&buf[..n])?;
                         prog.add(n as u64);
                         if prog.cancelled() {
-                            return Err(io::Error::other("cancelled"));
+                            return Err(crate::jobs::cancelled());
                         }
                     }
                     f.flush()
                 })();
                 match r {
                     Ok(_) => *files += 1,
-                    Err(e) if e.to_string() == "cancelled" => return Err(e),
-                    Err(_) => *failed += 1,
+                    Err(e) if crate::jobs::is_cancelled(&e) => return Err(e),
+                    Err(e) => failed.push(format!("{}: {}", p.display(), e)),
                 }
             }
         }
         Ok(())
     }
+    let mut used = std::collections::HashSet::new();
     for e in items {
-        go(doc, e, dest, prog, &mut files, &mut failed)?;
+        go(doc, e, dest, &mut used, prog, &mut files, &mut failed)?;
     }
     Ok((files, failed))
 }
@@ -441,7 +468,7 @@ pub fn test_image(doc: &Document, prog: &Progress) -> io::Result<(u64, Vec<Strin
     fn go(doc: &Document, e: &Entry, path: &str, prog: &Progress, ok: &mut u64, bad: &mut Vec<String>) -> io::Result<()> {
         for k in e.children().into_iter().flatten() {
             if prog.cancelled() {
-                return Err(io::Error::other("cancelled"));
+                return Err(crate::jobs::cancelled());
             }
             let p = format!("{}/{}", path, k.name);
             match &k.kind {
@@ -459,12 +486,16 @@ pub fn test_image(doc: &Document, prog: &Progress) -> io::Result<(u64, Vec<Strin
                             }
                             n += k as u64;
                             prog.add(k as u64);
+                            if prog.cancelled() {
+                                return Err(crate::jobs::cancelled());
+                            }
                         }
                         Ok(n)
                     })();
                     match r {
                         Ok(n) if n == *size => *ok += 1,
                         Ok(n) => bad.push(format!("{}: short read ({} of {} bytes)", p, n, size)),
+                        Err(e) if crate::jobs::is_cancelled(&e) => return Err(e),
                         Err(e) => bad.push(format!("{}: {}", p, e)),
                     }
                 }
@@ -495,7 +526,7 @@ pub fn checksum(mut r: impl Read, total: u64, prog: &Progress) -> io::Result<Sum
     let mut n = 0u64;
     loop {
         if prog.cancelled() {
-            return Err(io::Error::other("cancelled"));
+            return Err(crate::jobs::cancelled());
         }
         let k = r.read(&mut buf)?;
         if k == 0 {
@@ -530,7 +561,7 @@ pub fn split_file(src: &Path, part: u64, prog: &Progress) -> io::Result<Vec<Path
         let mut left = part.min(total - done);
         while left > 0 {
             if prog.cancelled() {
-                return Err(io::Error::other("cancelled"));
+                return Err(crate::jobs::cancelled());
             }
             let n = (left as usize).min(buf.len());
             f.read_exact(&mut buf[..n])?;
@@ -586,4 +617,64 @@ pub fn search(root: &Entry, query: &str) -> Vec<(Vec<String>, bool, u64)> {
     }
     go(root, &mut Vec::new(), &mut out, &matches);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::FileSrc;
+    use std::collections::HashSet;
+
+    #[test]
+    fn safe_name_cleans_dangerous_names() {
+        let mut u = HashSet::new();
+        assert_eq!(safe_name("..", &mut u), "_");
+        assert_eq!(safe_name(".", &mut u), "_ (2)");
+        assert_eq!(safe_name("a/../b", &mut u), "a_.._b");
+        assert_eq!(safe_name("CON", &mut u), "_CON");
+        assert_eq!(safe_name("nul.txt", &mut u), "_nul.txt");
+        assert_eq!(safe_name("com1", &mut u), "_com1");
+        assert_eq!(safe_name("COM0", &mut u), "COM0");
+        assert_eq!(safe_name("readme. ", &mut u), "readme");
+        assert_eq!(safe_name("README", &mut u), "README (2)");
+        assert_eq!(safe_name("x.tar.gz", &mut u), "x.tar.gz");
+        assert_eq!(safe_name("X.TAR.GZ", &mut u), "X.TAR (2).GZ");
+    }
+
+    fn mem_file(name: &str, data: &[u8]) -> Entry {
+        Entry { name: name.into(), mtime: 0, kind: Kind::File { size: data.len() as u64, src: FileSrc::Mem(std::sync::Arc::new(data.to_vec())) }, lba: None, hidden: false }
+    }
+
+    #[test]
+    fn extract_stays_inside_the_destination() {
+        let base = std::env::temp_dir().join(format!("hexiso-test-{}-extract", std::process::id()));
+        let dest = base.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        let items = vec![
+            Entry::dir("..", vec![mem_file("escaped.txt", b"x")]),
+            mem_file("../escaped2.txt", b"y"),
+            mem_file("a.txt", b"1"),
+            mem_file("A.TXT", b"2"),
+        ];
+        let (n, failed) = extract(&Document::new_blank(), &items, &dest, &Progress::default()).unwrap();
+        let outside = base.join("escaped.txt").exists() || base.join("escaped2.txt").exists();
+        let dup = std::fs::read(dest.join("A (2).TXT"));
+        let nested = dest.join("_").join("escaped.txt").exists();
+        std::fs::remove_dir_all(&base).ok();
+        assert!(failed.is_empty(), "{:?}", failed);
+        assert_eq!(n, 4);
+        assert!(!outside);
+        assert!(nested);
+        assert_eq!(dup.unwrap(), b"2");
+    }
+
+    #[test]
+    fn extract_cancel_is_reported_as_cancel() {
+        let dest = std::env::temp_dir().join(format!("hexiso-test-{}-cancel", std::process::id()));
+        let prog = Progress::default();
+        prog.cancel();
+        let r = extract(&Document::new_blank(), &[mem_file("a", b"1")], &dest, &prog);
+        std::fs::remove_dir_all(&dest).ok();
+        assert!(crate::jobs::is_cancelled(&r.unwrap_err()));
+    }
 }

@@ -238,8 +238,10 @@ impl Document {
                 let z = self.zip.clone().ok_or_else(|| crate::source::bad("archive is closed"))?;
                 let mut a = z.0.lock().unwrap();
                 let mut f = a.by_index(*i).map_err(|e| io::Error::other(e.to_string()))?;
-                let mut v = Vec::with_capacity(size as usize);
-                f.read_to_end(&mut v)?;
+                // `size` comes from the archive header: never trust it for the allocation, and
+                // never read more than it promises (zip bombs)
+                let mut v = Vec::with_capacity(size.min(64 << 20) as usize);
+                (&mut f).take(size).read_to_end(&mut v)?;
                 Box::new(io::Cursor::new(v))
             }
         })

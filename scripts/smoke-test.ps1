@@ -72,13 +72,25 @@ Check "split + read .001"        { Hx split $iso --size 1 -q | Out-Null; $j = Hx
 Check "floppy"                   { $f = Join-Path $work "f.img"; Hx floppy $f (Join-Path $src "readme.txt") -q | Out-Null; $j = Hx info $f --json | ConvertFrom-Json; if ($j.filesystem -eq "FAT" -and $j.files -eq 1) { "FAT12 ok" } else { "FAIL" } }
 Check "exit codes"               { Hx bogus | Out-Null; $a = $LASTEXITCODE; Hx info (Join-Path $work "missing.iso") | Out-Null; $b = $LASTEXITCODE; if ($a -eq 2 -and $b -eq 1) { "usage=2, failure=1" } else { "FAIL $a $b" } }
 Check "drives"                   { $d = Hx drives --json | ConvertFrom-Json; "$(@($d).Count) drive(s)" }
+Check "damaged images"           {
+    # headers that promise impossible sizes must give a clean error (exit 1), never a crash
+    $bad = @{}
+    $bad["garbage.iso"] = [byte[]](1..100000 | ForEach-Object { ($_ * 7919) % 256 })
+    $bad["huge.cso"] = [byte[]]([Text.Encoding]::ASCII.GetBytes("CISO") + [BitConverter]::GetBytes([uint32]24) + [BitConverter]::GetBytes([uint64]1125899906842624) + [BitConverter]::GetBytes([uint32]2048) + [byte[]](1, 0, 0, 0))
+    $hxz = New-Object byte[] 96; [Text.Encoding]::ASCII.GetBytes("HXZ1").CopyTo($hxz, 0); [BitConverter]::GetBytes([uint64]1099511627776).CopyTo($hxz, 12); [BitConverter]::GetBytes([uint32]4294967295).CopyTo($hxz, 20); [BitConverter]::GetBytes([uint64]96).CopyTo($hxz, 24)
+    $bad["huge.hxz"] = $hxz
+    $codes = foreach ($k in $bad.Keys) { $p = Join-Path $work $k; [IO.File]::WriteAllBytes($p, $bad[$k]); Hx info $p | Out-Null; "${k}=$LASTEXITCODE" }
+    if (@($codes | Where-Object { $_ -notmatch "=(0|1)$" }).Count -eq 0) { $codes -join ", " } else { "FAIL $($codes -join ', ')" }
+}
+Check "usb rejects unknown fs"   { $o = & $Exe usb $iso --drive Z --format "FAT32;exit" --yes 2>&1 | Out-String; if ($LASTEXITCODE -eq 1 -and $o -match "unknown file system") { "refused before touching any drive" } else { "FAIL exit $LASTEXITCODE $o" } }
 if ($Mount) {
     Check "mount / unmount"      {
         $l = (Hx mount $iso -q | Select-Object -First 1)
         $before = (Hx mounts --json | ConvertFrom-Json) | Where-Object { $_.image -like "*\t.iso" }
+        $again = (Hx mount $iso --json | ConvertFrom-Json)
         Hx unmount $iso | Out-Null
         $after = (Hx mounts --json | ConvertFrom-Json) | Where-Object { $_.image -like "*\t.iso" }
-        if ($l -match "^[A-Z]$" -and @($before).Count -ge 1 -and @($after).Count -eq 0) { "mounted as ${l}:, listed, ejected" } else { "FAIL '$l' before=$(@($before).Count) after=$(@($after).Count)" }
+        if ($l -match "^[A-Z]$" -and @($before).Count -ge 1 -and $again.already -and @($after).Count -eq 0) { "mounted as ${l}:, listed, re-mount detected, ejected" } else { "FAIL '$l' before=$(@($before).Count) again=$($again.already) after=$(@($after).Count)" }
     }
 }
 

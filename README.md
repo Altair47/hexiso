@@ -35,7 +35,7 @@ Free software under the [GNU AGPL-3.0](LICENSE) · **[Download the latest releas
 | **Build** | New ISO 9660 + Joliet images (long Unicode names, files over 4 GB), BIOS and UEFI bootable images, FAT12 floppy images, ZIP archives. |
 | **Convert & compress** | Any readable disc image to plain ISO, CSO (compressed ISO) or HXZ (compressed, optionally password-encrypted). Compression runs on all CPU cores. |
 | **Extract** | Single files, folders or everything, with progress, speed, ETA and cancel. |
-| **Mount** | Mounts an image as a virtual DVD drive with Windows' built-in mounter (no driver to install). Detects images that are already mounted and offers remount / mount another copy / eject all. |
+| **Mount** | Mounts an image as a virtual DVD drive with Windows' built-in mounter (no driver to install; needs an administrator account). Detects images that are already mounted and offers open / eject per drive, remount and eject all. |
 | **Burn & copy** | Burns an image to CD / DVD / BD with the Windows Disc Image Burner; copies a disc (read to a temporary ISO, then burn). |
 | **Drives** | Make an image from a disc or USB drive, browse a drive directly, rip audio CDs to WAV. |
 | **Bootable USB** | Copies an install image's files onto a USB stick, optionally formatting it as FAT32 / NTFS / exFAT first. |
@@ -185,8 +185,9 @@ Commands that change an image (`add`, `rm`, `rename`, `mkdir`, `label`, `boot`) 
 | `split <file> --size <MB>` | Split into `file.001`, `file.002`, ... |
 | `drives` | List drives (letter, type, file system, label, size). |
 | `mounts` | List mounted images and their drive letters. |
-| `mount <image> [--again]` | Mount and print the drive letter. If the image is already mounted, prints that letter instead (`--again` adds another drive). Non-ISO formats are converted to a temporary ISO first. |
+| `mount <image>` | Mount and print the drive letter. If the image is already mounted, prints that letter instead. Non-ISO formats are converted to a temporary ISO first. Needs an administrator account. |
 | `unmount <image>` | Eject every drive made from this image. |
+| `eject --drive E` | Open the disc tray or prepare a USB stick for removal; for a mounted image's drive, unmounts it. |
 | `burn <image> --drive E` | Open the Windows Disc Image Burner for drive E (non-ISO formats are converted first). |
 | `make-image --drive E <out>` | Read a disc or USB drive into `.iso`, `.cso` or `.hxz`. |
 | `rip --drive E <dest> [--tracks 1,3]` | Rip audio CD tracks to WAV. |
@@ -282,19 +283,20 @@ Most of HEXISO is portable Rust; only the drive features talk to Windows. In det
 | List drives (type, label, size) | Win32 API via `windows-sys`: `GetLogicalDrives`, `GetDriveTypeW`, `GetVolumeInformationW`, `GetDiskFreeSpaceExW` | Yes | `/sys/block`, `/proc/mounts` or `lsblk --json`. |
 | Read a disc / USB drive (make image, browse drive, copy disc) | Opens `\\.\D:` and reads it with Rust's file API; size via `DeviceIoControl(IOCTL_DISK_GET_LENGTH_INFO)` | Yes (device path + one ioctl) | Open `/dev/sr0`, `/dev/sdX`; size via `BLKGETSIZE64`. The reading code itself is shared. |
 | Rip audio CD | `DeviceIoControl` with `IOCTL_CDROM_READ_TOC` and `IOCTL_CDROM_RAW_READ` | Yes | `ioctl(CDROMREADTOCHDR / CDROMREADTOCENTRY / CDROMREADAUDIO)` on `/dev/sr0`. |
-| Mount / unmount / list mounted | **Runs PowerShell** (`Mount-DiskImage`, `Dismount-DiskImage`, `Get-Volume \| Get-DiskImage`) using Windows' built-in virtual drive | Yes | `udisksctl loop-setup` + `udisksctl mount`, or `mount -o loop` (root). |
+| Mount / unmount / list mounted | Windows virtual disk API via `windows-sys`: `OpenVirtualDisk` + `AttachVirtualDisk` / `DetachVirtualDisk`, image path of each drive from `GetStorageDependencyInformation` | Yes | `udisksctl loop-setup` + `udisksctl mount`, or `mount -o loop` (root). |
 | Burn | **Starts `isoburn.exe`** (Windows Disc Image Burner) | Yes | `xorriso` / `growisofs`, or `libburn` bindings for in-app burning. |
-| Format USB stick | **Runs PowerShell** `Format-Volume` | Yes | `mkfs.vfat` / `mkfs.exfat` / `mkfs.ntfs`. |
-| Eject disc | **Runs PowerShell** (Shell COM "Eject" verb) | Yes | `eject` / `udisksctl power-off`. |
-| Open a file / show in folder | `cmd /c start`, `explorer /select` | Yes | `xdg-open` (already used on non-Windows builds). |
+| Format USB stick | **Runs PowerShell** `Format-Volume` (file system checked against a fixed list first) | Yes | `mkfs.vfat` / `mkfs.exfat` / `mkfs.ntfs`. |
+| Eject disc / USB stick | `DeviceIoControl`: lock, dismount, `IOCTL_STORAGE_EJECT_MEDIA` (a mounted image is detached instead) | Yes | `eject` / `udisksctl power-off`. |
+| Open a file / show in folder | `ShellExecuteW`, `explorer /select` | Yes | `xdg-open` (already used on non-Windows builds). |
 | Console handling, icon | Win32 console API; resource embedded by `build.rs` | Yes | Not needed. |
 
-So: **the PowerShell and Windows-program calls are limited to mount, unmount, mounted-image listing,
-formatting, ejecting and burning** (all in `src/drives.rs`). Everything that reads, writes or converts
-images is Rust. Windows-specific code is behind `#[cfg(windows)]` and the rest of the crate already
-uses portable file APIs (`read_at` on Unix, `seek_read` on Windows), so a Linux build should compile
-with only the drive features unavailable. That has **not been tested yet**. A Linux port means
-writing the right-hand column into `drives.rs`.
+So: **PowerShell is used only for formatting, and `isoburn.exe` only for burning** (both in
+`src/drives.rs`). Everything that reads, writes or converts images is Rust. Windows-specific code is
+behind `#[cfg(windows)]`, and every public function in `drives.rs` has a non-Windows version that
+returns an empty list or a clear "not available on this system yet" error. The rest of the crate uses
+portable file APIs (`read_at` on Unix, `seek_read` on Windows), so a Linux build should compile with
+only the drive features unavailable. That has **not been tested yet**. A Linux port means writing the
+right-hand column into `drives.rs`.
 
 ---
 
@@ -327,11 +329,15 @@ cargo build --release          # -> target\release\hexiso.exe
 ## Testing
 
 ```powershell
-cargo clippy                                                     # lint, must be clean
+cargo clippy --all-targets                                       # lint, must be clean
+cargo test --release                                             # unit tests: damaged images, safe extract names (seconds)
 cargo run --release -- selftest                                  # engine self-test (seconds)
 powershell -ExecutionPolicy Bypass -File scripts\smoke-test.ps1  # full smoke test (minutes)
 ```
 
+* **Unit tests** (`#[cfg(test)]` at the end of `source.rs`, `hxz.rs`, `fs_fat.rs`, `ops.rs`): images whose
+  headers promise impossible sizes must give an error rather than crash or exhaust memory, and extracted
+  names such as `..`, `CON` or `a/../b` must stay inside the destination folder.
 * **Self-test** (`src/selftest.rs`): builds a sample tree with long and Unicode names, writes an ISO with
   a boot entry, re-reads it through Joliet and ISO 9660 comparing every byte, converts to CSO / HXZ /
   encrypted HXZ, checks a wrong password is refused, edits an image in place, round-trips a FAT12
@@ -339,7 +345,8 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke-test.ps1  # full smoke te
   too: `hexiso selftest C:\tmp\st win11.iso ubuntu.iso`.
 * **Smoke test** (`scripts/smoke-test.ps1`): runs the release exe through every command-line family
   with JSON checks and byte comparisons, takes window screenshots with both renderers, measures redraw
-  speed, and fails if the idle window uses CPU. `-Mount` also mounts and ejects a test image. GPU checks
+  speed, and fails if the idle window uses CPU. It also opens deliberately damaged images (must fail
+  cleanly) and checks that an unknown USB file system is refused. `-Mount` also mounts, re-mounts and ejects a test image. GPU checks
   are skipped when the desktop session is disconnected (Direct3D can't present there).
 * **Screenshots**: `hexiso --screenshot out.png [image] [--view sectors --lba 16]` opens the window,
   draws it, saves a PNG and exits.
@@ -371,11 +378,11 @@ homepage is `https://github.com/Altair47/hexiso`; override with `-Url` / `-Homep
 **Publishing a version (automated):** bump `version` in `Cargo.toml`, commit, then
 
 ```powershell
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
-`.github/workflows/ci.yml` (which also runs clippy, a release build, the engine self-test and a
+`.github/workflows/ci.yml` (which also runs clippy, the unit tests, a release build, the engine self-test and a
 command-line check on every push and pull request) then packages the release and attaches the zip and
 `hexiso.json` to a **draft** release on
 [github.com/Altair47/hexiso/releases](https://github.com/Altair47/hexiso/releases). Review it and click
@@ -413,6 +420,7 @@ manifest) that the CI workflow runs on every `v*` tag.
 ```text
 src/main.rs       start-up: window or command line, console handling
 src/app.rs        main window (toolbar, folder tree, file list, panels, activity log)
+src/app/actions.rs  window actions: open, save, edit, extract, mount, test, shortcuts
 src/dialogs.rs    dialogs (burn, mount, convert, USB, rip, boot, checksums, ...)
 src/soft.rs       CPU renderer window loop (used when there is no GPU)
 src/theme.rs      colours and fonts

@@ -26,7 +26,8 @@ it is licensed under the same terms.
 ## Before opening a pull request
 
 ```powershell
-cargo clippy                                                     # no warnings
+cargo clippy --all-targets                                       # no warnings
+cargo test --release                                             # unit tests pass
 cargo run --release -- selftest                                  # ALL PASSED
 powershell -ExecutionPolicy Bypass -File scripts\smoke-test.ps1  # SMOKE TEST PASSED
 hexiso --screenshot shot.png some.iso                            # for UI changes: look at it

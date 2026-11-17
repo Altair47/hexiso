@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub const SECTOR: u64 = 2048;
+/// Largest block size accepted from a compressed image header (CSO); larger means damaged.
+pub const MAX_BLOCK: u64 = 16 << 20;
 
 pub trait SectorSource: Send + Sync {
     /// Number of 2048-byte sectors.
@@ -35,7 +37,7 @@ pub fn read_range(src: &dyn SectorSource, offset: u64, buf: &mut [u8]) -> io::Re
     if skip == 0 && buf.len().is_multiple_of(SECTOR as usize) {
         return src.read_sectors(first, buf);
     }
-    let end = offset + buf.len() as u64;
+    let end = offset.checked_add(buf.len() as u64).filter(|e| *e <= u64::MAX - SECTOR).ok_or_else(|| bad("read past the end of the image"))?;
     let last = end.div_ceil(SECTOR);
     let count = (last - first) as usize;
     // read in chunks to bound memory
@@ -192,7 +194,7 @@ pub struct CsoImage {
     align: u32,
     block: u64,
     total: u64,
-    cache: Mutex<Option<(u64, Vec<u8>)>>,
+    cache: Mutex<Option<(u64, Block)>>,
 }
 
 impl CsoImage {
@@ -207,41 +209,50 @@ impl CsoImage {
         let total = u64le(&h, 8);
         let block = u32le(&h, 16) as u64;
         let align = h[21] as u32;
-        if block == 0 || !block.is_multiple_of(512) {
+        if block == 0 || !block.is_multiple_of(512) || block > MAX_BLOCK {
             return Err(bad("CSO block size is invalid"));
         }
+        if align > 31 {
+            return Err(bad("CSO alignment is invalid"));
+        }
+        // the index (4 bytes per block) must fit in the file: bounds the allocation below
+        let file_len = file.metadata()?.len();
         let blocks = total.div_ceil(block);
-        let mut raw = vec![0u8; ((blocks + 1) * 4) as usize];
+        let index_len = blocks.checked_add(1).and_then(|n| n.checked_mul(4)).filter(|&n| header_size.saturating_add(n) <= file_len).ok_or_else(|| bad("CSO index is larger than the file (damaged image)"))?;
+        let mut raw = vec![0u8; index_len as usize];
         read_exact_at(&file, &mut raw, header_size)?;
         let index = raw.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
         Ok(CsoImage { file, index, align, block, total, cache: Mutex::new(None) })
     }
-    fn block_data(&self, b: u64) -> io::Result<Vec<u8>> {
+    fn block_data(&self, b: u64) -> io::Result<Block> {
         if let Some((cb, d)) = &*self.cache.lock().unwrap()
             && *cb == b {
                 return Ok(d.clone());
             }
         let i = b as usize;
         if i + 1 >= self.index.len() {
-            return Ok(vec![0; self.block as usize]);
+            return Ok(vec![0; self.block as usize].into());
         }
         let e0 = self.index[i];
         let e1 = self.index[i + 1];
         let plain = e0 & 0x8000_0000 != 0;
         let start = ((e0 & 0x7FFF_FFFF) as u64) << self.align;
         let end = ((e1 & 0x7FFF_FFFF) as u64) << self.align;
-        let len = end.saturating_sub(start) as usize;
-        let mut comp = vec![0u8; len];
+        let len = end.saturating_sub(start);
+        // a stored block is at most one block plus alignment padding (capped at one more block)
+        if len > self.block + (1u64 << self.align).min(self.block) {
+            return Err(bad("CSO block is larger than allowed (damaged image)"));
+        }
+        let mut comp = vec![0u8; len as usize];
         read_exact_at(&self.file, &mut comp, start)?;
-        let data = if plain {
+        let data: Block = if plain {
             comp.resize(self.block as usize, 0);
-            comp
+            comp.into()
         } else {
             let mut out = Vec::with_capacity(self.block as usize);
-            let mut d = flate2::read::DeflateDecoder::new(&comp[..]);
-            d.read_to_end(&mut out)?;
+            flate2::read::DeflateDecoder::new(&comp[..]).take(self.block).read_to_end(&mut out)?;
             out.resize(self.block as usize, 0);
-            out
+            out.into()
         };
         *self.cache.lock().unwrap() = Some((b, data.clone()));
         Ok(data)
@@ -267,11 +278,14 @@ impl SectorSource for CsoImage {
     }
 }
 
+/// One decoded block of a compressed image, shared with the single-block cache without copying.
+pub type Block = Arc<[u8]>;
+
 pub fn read_blocked(
     mut off: u64,
     buf: &mut [u8],
     block: u64,
-    mut get: impl FnMut(u64) -> io::Result<Vec<u8>>,
+    mut get: impl FnMut(u64) -> io::Result<Block>,
 ) -> io::Result<()> {
     let mut pos = 0usize;
     while pos < buf.len() {
@@ -497,4 +511,74 @@ fn open_cue(path: &Path) -> io::Result<Src> {
     let f = MultiFile::single(&bin)?;
     let count = f.total / ss;
     Ok(Arc::new(RawImage { file: f, header: 0, sector_size: ss, data_off: doff, count, name: format!("BIN/CUE ({})", mode) }))
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+
+    /// An image held in memory; reads past the end return zeros like a truncated file.
+    pub struct MemSrc(pub Vec<u8>);
+
+    impl SectorSource for MemSrc {
+        fn sector_count(&self) -> u64 {
+            (self.0.len() as u64).div_ceil(SECTOR)
+        }
+        fn read_sectors(&self, lba: u64, buf: &mut [u8]) -> io::Result<()> {
+            buf.fill(0);
+            let start = (lba.saturating_mul(SECTOR) as usize).min(self.0.len());
+            let n = (self.0.len() - start).min(buf.len());
+            buf[..n].copy_from_slice(&self.0[start..start + n]);
+            Ok(())
+        }
+        fn format_name(&self) -> String {
+            "memory".into()
+        }
+    }
+
+    /// A fresh file in the temp folder holding `data`.
+    pub fn temp_file(name: &str, data: &[u8]) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("hexiso-test-{}-{}", std::process::id(), name));
+        std::fs::write(&p, data).unwrap();
+        p
+    }
+
+    fn cso_header(total: u64, block: u32, align: u8) -> Vec<u8> {
+        let mut h = b"CISO".to_vec();
+        h.extend_from_slice(&24u32.to_le_bytes());
+        h.extend_from_slice(&total.to_le_bytes());
+        h.extend_from_slice(&block.to_le_bytes());
+        h.extend_from_slice(&[1, align, 0, 0]);
+        h
+    }
+
+    #[test]
+    fn read_range_near_u64_max_is_an_error() {
+        let src = MemSrc(vec![0; 4096]);
+        let mut buf = [0u8; 100];
+        assert!(read_range(&src, u64::MAX - 10, &mut buf).is_err());
+    }
+
+    #[test]
+    fn cso_index_larger_than_file_is_refused() {
+        // claims 2^50 bytes of data: the index would need terabytes of memory
+        let p = temp_file("huge.cso", &cso_header(1 << 50, 2048, 0));
+        let r = CsoImage::open(&p);
+        std::fs::remove_file(&p).ok();
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn cso_oversized_block_is_an_error() {
+        let mut f = cso_header(2048, 2048, 0);
+        f.extend_from_slice(&32u32.to_le_bytes());
+        f.extend_from_slice(&0x7FFF_FFFFu32.to_le_bytes()); // next block 2 GB away
+        let p = temp_file("bigblock.cso", &f);
+        let img = CsoImage::open(&p).unwrap();
+        let mut buf = vec![0u8; 2048];
+        let r = img.read_sectors(0, &mut buf);
+        drop(img);
+        std::fs::remove_file(&p).ok();
+        assert!(r.is_err());
+    }
 }

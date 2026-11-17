@@ -81,7 +81,7 @@ impl HxzWriter {
         let n = threads();
         let level = self.level;
         let cipher = &self.cipher;
-        let results: Vec<(Vec<u8>, u32)> = std::thread::scope(|s| {
+        let results: Vec<Vec<(Vec<u8>, u32)>> = std::thread::scope(|s| {
             let chunk = blocks.len().div_ceil(n);
             let handles: Vec<_> = blocks
                 .chunks(chunk.max(1))
@@ -95,7 +95,7 @@ impl HxzWriter {
                                 let c = deflate(level, b);
                                 let (mut data, flag) = if c.len() < b.len() { (c, 1u32) } else { (b.clone(), 0u32) };
                                 if let Some(ci) = cipher {
-                                    data = ci.encrypt(Nonce::from_slice(&nonce(idx)), data.as_ref()).unwrap_or_default();
+                                    data = ci.encrypt(Nonce::from_slice(&nonce(idx)), data.as_ref()).expect("ChaCha20-Poly1305 encryption of a 64 KB block cannot fail");
                                 }
                                 (data, flag)
                             })
@@ -103,9 +103,10 @@ impl HxzWriter {
                     })
                 })
                 .collect();
-            handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
-        });
-        for (data, flag) in results {
+            // a worker that panicked must fail the write, not leave a hole in the index
+            handles.into_iter().map(|h| h.join().map_err(|_| io::Error::other("compression worker crashed"))).collect::<io::Result<Vec<_>>>()
+        })?;
+        for (data, flag) in results.into_iter().flatten() {
             self.f.write_all(&data)?;
             self.index.push((self.pos, data.len() as u32, flag));
             self.pos += data.len() as u64;
@@ -178,7 +179,7 @@ pub struct HxzImage {
     total: u64,
     index: Vec<(u64, u32, u32)>,
     cipher: Option<ChaCha20Poly1305>,
-    cache: Mutex<Option<(u64, Vec<u8>)>>,
+    cache: Mutex<Option<(u64, crate::source::Block)>>,
     packed: u64,
 }
 
@@ -205,20 +206,30 @@ impl HxzImage {
         } else {
             None
         };
-        let mut raw = vec![0u8; count * 16];
+        // the index must fit in the file: bounds the allocation below
+        let packed = f.metadata()?.len();
+        let index_len = (count as u64).checked_mul(16).filter(|&n| index_off.checked_add(n).is_some_and(|end| end <= packed)).ok_or_else(|| crate::source::bad("HXZ index is larger than the file (damaged image)"))?;
+        if total > count as u64 * BLOCK as u64 {
+            return Err(crate::source::bad("HXZ size does not match its index (damaged image)"));
+        }
+        let mut raw = vec![0u8; index_len as usize];
         read_exact_at(&f, &mut raw, index_off)?;
         let index = raw.chunks(16).map(|c| (u64le(c, 0), u32le(c, 8), u32le(c, 12))).collect();
-        let packed = f.metadata()?.len();
         Ok(HxzImage { f, total, index, cipher, cache: Mutex::new(None), packed })
     }
-    fn block(&self, b: u64) -> io::Result<Vec<u8>> {
+    fn block(&self, b: u64) -> io::Result<crate::source::Block> {
         if let Some((cb, d)) = &*self.cache.lock().unwrap()
             && *cb == b {
                 return Ok(d.clone());
             }
         let Some(&(off, len, flag)) = self.index.get(b as usize) else {
-            return Ok(vec![0; BLOCK]);
+            return Ok(vec![0; BLOCK].into());
         };
+        // stored blocks are at most a block plus the 16-byte encryption tag (deflate output that
+        // would be larger is stored plain); anything bigger is damage, not data
+        if len as usize > BLOCK + 64 {
+            return Err(crate::source::bad("HXZ block is larger than allowed (damaged image)"));
+        }
         let mut data = vec![0u8; len as usize];
         read_exact_at(&self.f, &mut data, off)?;
         if let Some(c) = &self.cipher {
@@ -226,10 +237,11 @@ impl HxzImage {
         }
         if flag & 1 != 0 {
             let mut out = Vec::with_capacity(BLOCK);
-            flate2::read::DeflateDecoder::new(&data[..]).read_to_end(&mut out)?;
+            flate2::read::DeflateDecoder::new(&data[..]).take(BLOCK as u64).read_to_end(&mut out)?;
             data = out;
         }
         data.resize(BLOCK, 0);
+        let data: crate::source::Block = data.into();
         *self.cache.lock().unwrap() = Some((b, data.clone()));
         Ok(data)
     }
@@ -362,5 +374,59 @@ impl Write for CsoWriter {
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source::tests::temp_file;
+
+    fn header(total: u64, count: u32, index_off: u64) -> Vec<u8> {
+        let mut h = vec![0u8; HEADER as usize];
+        h[0..4].copy_from_slice(MAGIC);
+        h[12..20].copy_from_slice(&total.to_le_bytes());
+        h[20..24].copy_from_slice(&count.to_le_bytes());
+        h[24..32].copy_from_slice(&index_off.to_le_bytes());
+        h
+    }
+
+    #[test]
+    fn index_larger_than_file_is_refused() {
+        let p = temp_file("huge.hxz", &header(1 << 40, u32::MAX, HEADER));
+        let r = HxzImage::open(&p, None);
+        std::fs::remove_file(&p).ok();
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn oversized_block_is_an_error() {
+        let mut f = header(BLOCK as u64, 1, HEADER);
+        f.extend_from_slice(&HEADER.to_le_bytes());
+        f.extend_from_slice(&u32::MAX.to_le_bytes()); // 4 GB block
+        f.extend_from_slice(&0u32.to_le_bytes());
+        let p = temp_file("bigblock.hxz", &f);
+        let img = HxzImage::open(&p, None).unwrap();
+        let mut buf = vec![0u8; SECTOR as usize];
+        let r = img.read_sectors(0, &mut buf);
+        drop(img);
+        std::fs::remove_file(&p).ok();
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn encrypted_round_trip_and_wrong_password() {
+        let p = std::env::temp_dir().join(format!("hexiso-test-{}-rt.hxz", std::process::id()));
+        let data: Vec<u8> = (0..BLOCK * 2 + 4096).map(|i| (i * 7 % 251) as u8).collect();
+        let mut w = HxzWriter::create(&p, Some("pw"), 6).unwrap();
+        w.write_all(&data).unwrap();
+        w.finish().unwrap();
+        assert!(HxzImage::open(&p, Some("nope")).is_err());
+        let img = HxzImage::open(&p, Some("pw")).unwrap();
+        let mut back = vec![0u8; data.len()];
+        img.read_sectors(0, &mut back).unwrap();
+        drop(img);
+        std::fs::remove_file(&p).ok();
+        assert!(back == data);
     }
 }

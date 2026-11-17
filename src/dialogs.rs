@@ -599,7 +599,7 @@ impl HexApp {
                 ui.checkbox(format, "format the drive first (ERASES EVERYTHING ON IT)");
                 if *format {
                     ui.horizontal(|ui| {
-                        for f in ["FAT32", "NTFS", "exFAT"] {
+                        for f in drives::FORMATS {
                             ui.radio_value(fs, f.to_string(), f);
                         }
                     });
@@ -618,11 +618,18 @@ impl HexApp {
                 ui.horizontal(|ui| {
                     if ui.add_enabled(ok, egui::Button::new("[ write ]")).clicked() {
                         let l = drive.unwrap();
+                        let chosen = self.drives.iter().find(|x| x.letter == l).map(|x| (x.label.clone(), x.total));
                         let doc = self.doc.clone();
                         let fmt = if *format { Some(fs.clone()) } else { None };
                         let label: String = doc.label.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(11).collect();
                         keep = false;
                         self.run("Writing USB drive", move |prog| {
+                            // the letter may now belong to another drive (stick swapped since the list was read)
+                            let now = drives::list().into_iter().find(|x| x.letter == l);
+                            match &now {
+                                Some(x) if x.kind == DriveKind::Removable && chosen.as_ref().is_some_and(|(lb, t)| *lb == x.label && *t == x.total) => {}
+                                _ => return Err(format!("drive {}: changed since it was chosen; press refresh and choose it again", l)),
+                            }
                             if let Some(f) = fmt {
                                 prog.say(format!("formatting {}: as {}", l, f));
                                 es(drives::format_drive(l, &f, if label.is_empty() { "HEXISO" } else { &label }))?;
@@ -631,7 +638,8 @@ impl HexApp {
                             let dest = PathBuf::from(format!("{}:\\", l));
                             let (n, failed) = es(ops::extract(&doc, &items, &dest, prog))?;
                             Ok(Box::new(move |app: &mut HexApp| {
-                                app.log(if failed > 0 { Lvl::Warn } else { Lvl::Ok }, format!("usb {}: ready, {} files copied{}", l, n, if failed > 0 { format!(", {} failed", failed) } else { String::new() }));
+                                app.log_failed(&failed);
+                                app.log(if failed.is_empty() { Lvl::Ok } else { Lvl::Warn }, format!("usb {}: ready, {} files copied{}", l, n, if failed.is_empty() { String::new() } else { format!(", {} failed", failed.len()) }));
                                 app.refresh_drives();
                             }) as Apply)
                         });
@@ -698,11 +706,31 @@ impl HexApp {
                 let letters: Vec<String> = existing.iter().map(|e| format!("{}:", if e.1.is_empty() { "?" } else { &e.1 })).collect();
                 ui.label(RichText::new(format!("{} is already mounted as {}.", name, letters.join(", "))).color(TEXT));
                 ui.add_space(4.0);
+                let mut keep = true;
+                let mut eject_one: Option<String> = None;
                 for (p, l) in existing.iter() {
-                    ui.label(RichText::new(format!("  {}:  {}", if l.is_empty() { "?" } else { l }, p)).color(DIM).small());
+                    ui.horizontal(|ui| {
+                        let letter = l.chars().next().filter(|c| c.is_ascii_alphabetic());
+                        if ui.add_enabled(letter.is_some(), egui::Button::new("open").small()).on_hover_text("Open this drive in Explorer.").clicked()
+                            && let Some(c) = letter {
+                                drives::open_in_shell(std::path::Path::new(&format!("{}:\\", c)));
+                                keep = false;
+                            }
+                        if ui.small_button("eject").on_hover_text("Unmount this drive.").clicked() {
+                            eject_one = Some(p.clone());
+                        }
+                        ui.label(RichText::new(format!("{}:", if l.is_empty() { "?" } else { l })).color(GREEN).strong());
+                        ui.add(egui::Label::new(RichText::new(p.as_str()).color(DIM).small()).truncate()).on_hover_text(p.as_str());
+                    });
+                }
+                if let Some(p) = eject_one {
+                    self.unmount(PathBuf::from(&p));
+                    existing.retain(|e| e.0 != p);
+                    if existing.is_empty() {
+                        keep = false;
+                    }
                 }
                 ui.add_space(8.0);
-                let mut keep = true;
                 let paths: Vec<String> = {
                     let mut v: Vec<String> = existing.iter().map(|e| e.0.clone()).collect();
                     v.dedup();
@@ -714,18 +742,9 @@ impl HexApp {
                         .on_hover_text("Eject the existing drive(s), then mount the image again as one fresh drive. Use this after changing the image.")
                         .clicked()
                     {
-                        self.mount_now(paths.clone(), false);
+                        self.mount_now(paths.clone());
                         keep = false;
                     }
-                    if ui.button("[ mount another copy ]").on_hover_text("Keep the existing drive(s) and add one more drive letter with the same image.").clicked() {
-                        self.mount_now(vec![], true);
-                        keep = false;
-                    }
-                    if let Some(l) = existing.iter().find_map(|e| e.1.chars().next()).filter(|c| c.is_ascii_alphabetic())
-                        && ui.button(format!("[ open {}: ]", l)).on_hover_text("Just open the drive that is already there.").clicked() {
-                            drives::open_in_shell(std::path::Path::new(&format!("{}:\\", l)));
-                            keep = false;
-                        }
                     if ui.button("[ eject all ]").on_hover_text("Unmount every drive of this image.").clicked() {
                         let ps = paths.clone();
                         self.run("Ejecting", move |_| {

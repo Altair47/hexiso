@@ -1,6 +1,6 @@
 [package]
 name = "hexiso"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Fast portable disc image toolkit: open, edit, extract, build, convert, compress, mount and burn ISO images"
 readme = "README.md"
@@ -32,7 +32,7 @@ hdrshot-egui-backend = "0.2"
 pollster = "1"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_Security", "Win32_System_Console"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Storage_Vhd", "Win32_System_IO", "Win32_System_Ioctl", "Win32_Security", "Win32_System_Console", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 png = "0.18.1"

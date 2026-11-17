@@ -24,7 +24,8 @@ All commands run from the crate root (the folder holding this file).
 |---|---|
 | Build (debug) | `cargo build` |
 | Build (release, what users get) | `cargo build --release` |
-| Lint (must be clean) | `cargo clippy` |
+| Lint (must be clean) | `cargo clippy --all-targets` |
+| Unit tests (seconds) | `cargo test --release` |
 | Engine self-test (fast, no GUI) | `cargo run --release -- selftest` |
 | Full smoke test (CLI, both renderers, performance) | `powershell -ExecutionPolicy Bypass -File scripts\smoke-test.ps1` (add `-Mount` to test virtual drives) |
 | Run the window | `cargo run --release` |
@@ -32,14 +33,15 @@ All commands run from the crate root (the folder holding this file).
 | Redraw benchmark | `$env:HEXISO_BENCH=1; hexiso` (prints frames per second, then exits) |
 | Release package + Scoop manifest | `powershell -ExecutionPolicy Bypass -File package.ps1 -Url <zip URL>` |
 
-Before you finish any change: `cargo clippy` is clean, `selftest` passes, and for UI changes you have
-looked at a `--screenshot` of the result.
+Before you finish any change: `cargo clippy --all-targets` is clean, `cargo test --release` and
+`selftest` pass, and for UI changes you have looked at a `--screenshot` of the result.
 
 ## Map
 
 ```text
 src/main.rs      start-up: CLI vs window, console handling, renderer choice, viewport setup
-src/app.rs       HexApp: state, actions, toolbar, panels, file table, sector view, log, status bar
+src/app.rs       HexApp: state, toolbar, panels, file table, sector view, log, status bar
+src/app/actions.rs  HexApp actions: open, save, edit, extract, mount, test, keyboard shortcuts
 src/dialogs.rs   Dialog enum + every modal dialog
 src/theme.rs     colours, fonts, widget visuals (the only place colours are defined)
 src/soft.rs      CPU renderer window loop (winit + egui-winit + softbuffer + rasterizer)
@@ -58,7 +60,7 @@ src/selftest.rs  end-to-end engine self-test
 src/icon_art.rs  pixel-art icon (also include!()-ed by build.rs)
 build.rs         icon + Windows version resource
 scripts/         smoke-test.ps1
-.github/         CI workflow (clippy, build, self-test; draft release on v* tags)
+.github/         CI workflow (clippy, unit tests, build, self-test; draft release on v* tags)
 docs/screenshots README pictures
 ```
 
@@ -74,8 +76,9 @@ docs/screenshots README pictures
    on `self.version`; call `touch()` after every edit). Use `ScrollArea::show_rows` for long lists.
 4. **Both renderers must work.** Don't use eframe-only APIs inside `HexApp::draw`; it is shared by
    `eframe::App::ui` and `soft.rs`. Test with `HEXISO_RENDERER=cpu` and `=gpu`.
-5. **Windows-only code stays in `drives.rs`** behind `#[cfg(windows)]` with a non-Windows fallback,
-   so a Linux port only has to rewrite that file.
+5. **Windows-only code stays in `drives.rs`** behind `#[cfg(windows)]` with a non-Windows twin of
+   every public function, so a Linux port only has to rewrite that file. Use the Win32 API through
+   `windows-sys`; PowerShell is used only for `Format-Volume`, don't add new PowerShell calls.
 6. **Every GUI feature should also exist on the command line**, and vice versa where it makes sense.
 7. **Plain language for people.** Labels, tooltips and log lines are written for non-experts; say what
    happened and what to do next. Every toolbar button and property has a tooltip.
@@ -84,6 +87,9 @@ docs/screenshots README pictures
 9. **Licence header** at the top of every source file:
    `// HEXISO - Copyright (C) Nick Petropoulos (https://github.com/Altair47)` /
    `// SPDX-License-Identifier: AGPL-3.0-only`.
+10. **Image contents are hostile.** Sizes, counts and offsets from headers never size an allocation
+   or a decompression without a bound (file length, block size); names from an image never become a
+   path without `ops::safe_name`.
 
 ## Guides (`.agents/skills/`)
 
